@@ -18,7 +18,7 @@ import java.util.*;
 public class ApplicationMaster {
     private int splits;
     // For testing purposes, how many containers to run in parallel initially.
-    private int parallel_containers = 2;
+    private int parallel_containers = 1;
     private int containersRequested = 0;
     private int containersGranted   = 0;
     private AMRMClient<ContainerRequest> rmClient;

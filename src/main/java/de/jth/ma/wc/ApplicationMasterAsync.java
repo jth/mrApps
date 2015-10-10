@@ -17,13 +17,19 @@ import org.apache.hadoop.yarn.util.Records;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
-    private static final int PARALLEL_CONTAINERS = 2;
+    private final AtomicInteger PARALLEL_CONTAINERS = new AtomicInteger(1);
+    private final AtomicBoolean increased = new AtomicBoolean(false);
+    private static final long DEADLINE = 16000; // Deadline in ms for whole job completion
+    private int estimatedDeadline = 0; // Estimated job finish
     private final Path inputPath;
     private final Path outputPath;
     private final int splits;
     private final List<ContainerRequest> requestList = new ArrayList<>();
+    private final List<ContainerId> finishedContainers = new ArrayList<>();
     private final Map<ContainerId, TimeTuple> containerTimes = new HashMap<>();
     private List<Container> allocatedContainers = new ArrayList<>();
     private Configuration configuration;
@@ -31,6 +37,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     private AMRMClientAsync<ContainerRequest> rmClient;
     private InputSplitter splitter;
     // Counters, use atomic integer here?
+    private final AtomicInteger completedContainers = new AtomicInteger(0);
     private int ctr = 0;
     private int absoluteContainersRequested = 0; // How many containers where requested overall during job?
     private int containersRequested = 0; // Containers requests pending
@@ -44,6 +51,11 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         TimeTuple(long startTime) {
             this.startTime = startTime;
             endTime = 0;
+        }
+
+        @Override
+        public String toString() {
+            return "startTime: " + startTime + ", endTime: " + endTime;
         }
     }
 
@@ -75,14 +87,15 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
                         " 2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr";
         try {
             // Launch container by create ContainerLaunchContext
-            ContainerLaunchContext ctx =
-                    Records.newRecord(ContainerLaunchContext.class);
+            ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
             ctx.setCommands(Collections.singletonList(command));
             System.out.println("[AM] Launching container " + container.getId());
-            ++runningContainers;
-            ++ctr;
-            containerTimes.put(container.getId(), new TimeTuple(System.currentTimeMillis()));
-            nmClient.startContainer(container, ctx);
+            synchronized (this) {
+                containerTimes.put(container.getId(), new TimeTuple(System.currentTimeMillis()));
+                ++runningContainers;
+                ++ctr;
+                nmClient.startContainer(container, ctx);
+            }
             System.out.println("execute: running Containers: " + runningContainers);
         } catch (Exception ex) {
             System.err.println("[AM] Error launching container " + container.getId() + " " + ex);
@@ -93,9 +106,9 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         System.out.println("Before onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
         System.out.println(" -> Allocated containers " + containers.size());
         for (Container container : containers) {
-            allocatedContainers.add(container);
-            System.out.println(" -> Allocated container: " + container.getId().toString());
             synchronized (this) {
+                allocatedContainers.add(container);
+                System.out.println(" -> Allocated container: " + container.getId().toString());
                 --containersRequested;
                 execute(container);
             }
@@ -103,39 +116,58 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         System.out.println("After onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
     }
 
-    public void onContainersCompleted(List<ContainerStatus> statuses) {
-        List<ContainerId> completed = new ArrayList<>();
+    private synchronized void estimateJobFinishTime() {
+        int taskSum = 0;
+        final int parallelTasks = splits / PARALLEL_CONTAINERS.get();
 
-        System.out.println("Before onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        Iterator it = containerTimes.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry pair = (Map.Entry)it.next();
+            TimeTuple t = (TimeTuple)pair.getValue();
+            if (t.endTime != 0) {
+                taskSum += (t.endTime - t.startTime);
+            }
+        }
+        taskSum /= containerTimes.size();
+        estimatedDeadline = taskSum * parallelTasks;
+        System.out.println(" = After " + finishedContainers.size() + " Container(s): estimatedDeadline is " + estimatedDeadline + " ms = ");
+    }
+
+    public void onContainersCompleted(List<ContainerStatus> statuses) {
+        //System.out.println("Before onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
         for (ContainerStatus status : statuses) {
             System.out.println("[AM] Completed container " + status.getContainerId());
             synchronized (this) {
                 --containersToWaitFor;
                 --runningContainers;
+                finishedContainers.add(status.getContainerId());
+                containerTimes.get(status.getContainerId()).endTime = System.currentTimeMillis();
             }
-            completed.add(status.getContainerId());
-            containerTimes.get(status.getContainerId()).endTime = System.currentTimeMillis();
+            completedContainers.incrementAndGet();
         }
+        estimateJobFinishTime();
         // Request new containers as the existing ones have completed
         // Make sure not more containers than PARALLEL_CONTAINERS are requested
         final int workingContainers = runningContainers + containersRequested;
-        if (workingContainers < PARALLEL_CONTAINERS && workingContainers < containersToWaitFor) {
-            final int toRequest = PARALLEL_CONTAINERS - Math.abs(runningContainers - containersRequested);
+        if (workingContainers < PARALLEL_CONTAINERS.get() && workingContainers < containersToWaitFor) {
+            final int toRequest = PARALLEL_CONTAINERS.get() - Math.abs(runningContainers - containersRequested);
             if (toRequest > containersToWaitFor) {
                 requestContainers(containersToWaitFor);
             } else {
                 requestContainers(toRequest);
             }
         }
-
-        System.out.println("After onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        System.out.println("Progress: " + getProgress());
+        //System.out.println("After onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
     }
 
     private void clearRequestList() {
-        for (ContainerRequest req : requestList) {
-            rmClient.removeContainerRequest(req);
+        synchronized (this) {
+            for (ContainerRequest req : requestList) {
+                rmClient.removeContainerRequest(req);
+            }
+            requestList.clear();
         }
-        requestList.clear();
     }
 
     private synchronized void requestContainers(int num) {
@@ -174,7 +206,15 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     }
 
     public float getProgress() {
-        return 0;
+        synchronized (this) {
+            float progress = (float) completedContainers.get() / splits;
+            if (increased.get() == false && progress >= 0.5f) {
+                System.out.println("Increasing from " + PARALLEL_CONTAINERS.get() + " container(s) to " + 4);
+                increased.set(true);
+                PARALLEL_CONTAINERS.set(4);
+            }
+            return progress;
+        }
     }
 
     public boolean doneWithContainers() {
@@ -208,9 +248,9 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         rmClient.registerApplicationMaster("", 0, "");
         System.out.println("[AM] registerApplicationMaster 1");
 
-        final TimeTuple absoluteTime = new TimeTuple(System.currentTimeMillis());
-        requestContainers(PARALLEL_CONTAINERS);
         System.out.println("[AM] waiting for containers to finish");
+        requestContainers(PARALLEL_CONTAINERS.get());
+        final TimeTuple absoluteTime = new TimeTuple(System.currentTimeMillis());
         while (!doneWithContainers()) {
             //System.out.println("runMainLoop(): Running containers: " + runningContainers);
             //System.out.println("runMainLoop(): Waiting for containers: " + containersToWaitFor);
@@ -230,18 +270,16 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     private void printContainerTimes() {
         Iterator it = containerTimes.entrySet().iterator();
         while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry)it.next();
-            ContainerId id = (ContainerId)pair.getKey();
-            TimeTuple t = (TimeTuple)pair.getValue();
-            System.out.println(id.toString() + " = " + (t.endTime - t.startTime) + " ms");
+            final Map.Entry pair = (Map.Entry)it.next();
+            final ContainerId id = (ContainerId)pair.getKey();
+            final TimeTuple t = (TimeTuple)pair.getValue();
+            System.out.println(id.toString() + " = " + (t.endTime - t.startTime) + " ms, started at " + t.startTime + " ms");
             it.remove(); // avoids a ConcurrentModificationException
         }
     }
 
     public static void main(String[] args) throws Exception {
         ApplicationMasterAsync master = new ApplicationMasterAsync(new Path(args[0]), new Path(args[1]));
-
         master.runMainLoop();
     }
-
 }

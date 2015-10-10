@@ -18,6 +18,7 @@ import java.util.Map;
  * Created by jth on 10/6/15.
  */
 public class Mapper {
+    private final static int WAIT_TIME = 5000;
     private final Path inputFile;
     private final String outputPath;
     private final int id;
@@ -57,8 +58,7 @@ public class Mapper {
                     if (!counts.containsKey(word)) {
                         counts.put(word, new Long(1));
                     } else {
-                        Long tmp = counts.get(word);
-                        counts.put(word, tmp + 1);
+                        counts.put(word, counts.get(word) + 1);
                     }
                 }
                 line = br.readLine();
@@ -68,7 +68,7 @@ public class Mapper {
             //System.out.println("Counted words, closing " + inputFile.getName());
             is.close();
             System.out.println("Writing results");
-            Thread.sleep(1000); // prolong tasks artifically...
+            Thread.sleep(WAIT_TIME); // prolong tasks artificially...
             writeResult(fs);
         }catch(Exception e){
             throw new RuntimeException("Could not open " + inputFile.getName() + ": " + e.getMessage());
