@@ -118,7 +118,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
 
     private synchronized void estimateJobFinishTime() {
         int taskSum = 0;
-        final int parallelTasks = splits / PARALLEL_CONTAINERS.get();
+        int parallelTasks = splits / PARALLEL_CONTAINERS.get();
 
         Iterator it = containerTimes.entrySet().iterator();
         while (it.hasNext()) {
@@ -130,6 +130,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         }
         taskSum /= containerTimes.size();
         estimatedDeadline = taskSum * parallelTasks;
+
         System.out.println(" = After " + finishedContainers.size() + " Container(s): estimatedDeadline is " + estimatedDeadline + " ms = ");
     }
 
