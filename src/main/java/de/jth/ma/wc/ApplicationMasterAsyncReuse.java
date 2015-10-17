@@ -13,6 +13,7 @@ import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest;
 import org.apache.hadoop.yarn.client.api.NMClient;
 import org.apache.hadoop.yarn.client.api.async.AMRMClientAsync;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.Records;
 
 import java.io.IOException;
@@ -20,30 +21,27 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
+public class ApplicationMasterAsyncReuse implements AMRMClientAsync.CallbackHandler {
     private static final boolean REUSE_CONTAINERS = true;
     private static final long DEADLINE = 16000; // Deadline in ms for whole job completion
+
     private final AtomicInteger PARALLEL_CONTAINERS = new AtomicInteger(1);
     private final AtomicBoolean increased = new AtomicBoolean(false);
     private int estimatedDeadline = 0; // Estimated job finish
-    private final Path inputPath;
     private final Path outputPath;
-    private final int splits;
-    private final List<ContainerRequest> requestList = new ArrayList<>();
-    private final List<ContainerId> finishedContainers = new ArrayList<>();
-    private final Map<ContainerId, TimeTuple> containerTimes = new HashMap<>();
-    private Map <Container, Boolean> allocatedContainers = new HashMap<>();
     private Configuration configuration;
     private NMClient nmClient;
     private AMRMClientAsync<ContainerRequest> rmClient;
     private InputSplitter splitter;
-    // Counters, use atomic integer here?
     private final AtomicInteger complatedTasks = new AtomicInteger(0);
-    private int ctr = 0;
     private int absoluteContainersRequested = 0; // How many containers where requested overall during job?
-    private int containersRequested = 0; // Containers requests pending
-    private int containersToWaitFor;
+    private int pendingRequests = 0; // Containers requests pending
+    private int tasksToWaitFor;
     private int runningContainers = 0;
+
+    private final List<MapTask> tasks = new ArrayList<>();
+    private final List<ContainerRequest> requestList = new ArrayList<>();
+    private Map <Container, Boolean> allocatedContainers = new HashMap<>();
 
     private static class TimeTuple {
         public long startTime;
@@ -60,8 +58,15 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         }
     }
 
-    public ApplicationMasterAsync(Path inputPath, Path outputPath) {
-        this.inputPath = inputPath;
+    private void initializeTasks(int splits) {
+        for (int i = 0; i < splits; ++i) {
+            tasks.add(new MapTask(i));
+        }
+    }
+
+    public ApplicationMasterAsyncReuse(Path inputPath, Path outputPath) {
+        int splits;
+
         this.outputPath = outputPath;
         splitter = new InputSplitter(inputPath);
         try {
@@ -69,60 +74,102 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         } catch (IOException e) {
             throw new RuntimeException("Could not split input: " + e.getMessage());
         }
-        splits = containersToWaitFor = splitter.getStats().size();
+        splits = tasksToWaitFor = splitter.getStats().size();
+        initializeTasks(splits);
         configuration = new YarnConfiguration();
         nmClient = NMClient.createNMClient();
         nmClient.init(configuration);
         nmClient.start();
     }
 
+    private MapTask getNextWaitingTask() {
+        for (MapTask task : tasks) {
+            if (!task.finished && !task.running) {
+                return task;
+            }
+        }
+        return null;
+    }
+
     private void execute(Container container) {
+        final MapTask task = getNextWaitingTask();
+
+        if (task == null) {
+            System.out.println("execute(): No tasks left, doing nothing");
+            return;
+        }
+
+        try {
+            final ContainerStatus status = nmClient.getContainerStatus(container.getId(), container.getNodeId());
+            System.out.println("Status of container " + container.getId().toString() + ": " + status.getState().toString());
+            Thread.sleep(100);
+        } catch (YarnException | IOException | InterruptedException e) {
+            e.printStackTrace();
+        }
         final String command =
                 "$JAVA_HOME/bin/java" +
                         " -Xmx128M" +
                         " de.jth.ma.wc.Mapper" +
-                        " " + splitter.getStats().get(ctr).getPath().toString() +
+                        " " + splitter.getStats().get(task.id).getPath().toString() +
                         " " + outputPath +
-                        " " + ctr +
-                        " 1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout" +
-                        " 2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr";
+                        " " + task.id +
+                        " 1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout_" + task.id +
+                        " 2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr_" + task.id;
         try {
             // Launch container by create ContainerLaunchContext
-            ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
-            ctx.setCommands(Collections.singletonList(command));
-            System.out.println("[AM] Launching container " + container.getId());
+            //if (task.launchContext == null) {
+                // Todo: Try this...
+                //ContainerLaunchContext.newInstance()
+            // Create container launch context in a proper way...
+                task.launchContext = Records.newRecord(ContainerLaunchContext.class);
+            //}
+            task.launchContext.setCommands(Collections.singletonList(command));
+            System.out.println("[AM] Launching task " + task.id + " on container " + container.getId());
             synchronized (this) {
-                containerTimes.put(container.getId(), new TimeTuple(System.currentTimeMillis()));
+                task.running = true;
+                task.startTime = System.currentTimeMillis();
+                task.mappedContainer = container;
                 allocatedContainers.put(container, true);
                 ++runningContainers;
-                ++ctr;
-                nmClient.startContainer(container, ctx);
+                nmClient.startContainer(container, task.launchContext);
             }
             System.out.println("execute: running Containers: " + runningContainers);
         } catch (Exception ex) {
-            System.err.println("[AM] Error launching container " + container.getId() + " " + ex);
+            System.err.println("[AM] Error launching container " + container.getId() + " " + ex + " " + ex.getMessage());
+            ex.printStackTrace();
+            try {
+                rmClient.unregisterApplicationMaster(FinalApplicationStatus.FAILED, "", "");
+            } catch (YarnException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
 
     public void onContainersAllocated(List<Container> containers) {
-        System.out.println("Before onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        System.out.println("Before onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + pendingRequests + " / " + tasksToWaitFor);
         System.out.println(" -> Allocated containers " + containers.size());
         for (Container container : containers) {
             synchronized (this) {
                 allocatedContainers.put(container, false);
                 System.out.println(" -> Allocated container: " + container.getId().toString());
-                --containersRequested;
+                --pendingRequests;
                 execute(container);
             }
         }
-        System.out.println("After onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        System.out.println("After onContainersAllocated: running / requested / waiting for: " + runningContainers + " / " + pendingRequests + " / " + tasksToWaitFor);
     }
 
     private synchronized void estimateJobFinishTime() {
+        /*
         int taskSum = 0;
-        int parallelTasks = splits / PARALLEL_CONTAINERS.get();
+        int parallelTasks = tasks.size() / PARALLEL_CONTAINERS.get();
 
-        Iterator it = containerTimes.entrySet().iterator();
+        for (MapTask task : tasks) {
+
+        }
+        Iterator it = taskTimes.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry pair = (Map.Entry)it.next();
             TimeTuple t = (TimeTuple)pair.getValue();
@@ -130,10 +177,11 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
                 taskSum += (t.endTime - t.startTime);
             }
         }
-        taskSum /= containerTimes.size();
+        taskSum /= taskTimes.size();
         estimatedDeadline = taskSum * parallelTasks;
 
-        System.out.println(" = After " + finishedContainers.size() + " Container(s): estimatedDeadline is " + estimatedDeadline + " ms = ");
+        System.out.println(" = After " + tasks.size() + " Tasks(s): estimatedDeadline is " + estimatedDeadline + " ms = ");
+        */
     }
 
     private void markContainerAsIdle(ContainerId containerId) {
@@ -146,33 +194,57 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         }
     }
 
+    private MapTask getCompletedTask(ContainerId containerId) {
+        for (MapTask task : tasks) {
+            if (task.mappedContainer == null) {
+                continue;
+            }
+            if (task.mappedContainer.getId().getContainerId() == containerId.getContainerId()) {
+                return task;
+            }
+        }
+        return null;
+    }
+
     public void onContainersCompleted(List<ContainerStatus> statuses) {
-        //System.out.println("Before onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        //System.out.println("Before onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + pendingRequests + " / " + tasksToWaitFor);
         for (ContainerStatus status : statuses) {
-            System.out.println("[AM] Completed container " + status.getContainerId());
+            final MapTask task = getCompletedTask(status.getContainerId());
             synchronized (this) {
-                --containersToWaitFor;
+                System.out.println("[AM] Completed container task " + task.id + " on container " + status.getContainerId());
+                try {
+                    nmClient.stopContainer(task.mappedContainer.getId(), task.mappedContainer.getNodeId());
+                    rmClient.releaseAssignedContainer(task.mappedContainer.getId());
+                } catch (YarnException | IOException e) {
+                    System.out.println("Could not stop container: " + e.getMessage());
+                    e.printStackTrace();
+                }
+                System.out.println("Stopped container " + task.mappedContainer.getId());
+                task.finished = true;
+                task.running = false;
+                --tasksToWaitFor;
                 --runningContainers;
-                finishedContainers.add(status.getContainerId());
-                containerTimes.get(status.getContainerId()).endTime = System.currentTimeMillis();
+                task.endTime = System.currentTimeMillis();
                 markContainerAsIdle(status.getContainerId());
             }
             complatedTasks.incrementAndGet();
+            // Execute new task on existing container
+            execute(task.mappedContainer);
         }
         estimateJobFinishTime();
         // Request new containers as the existing ones have completed
         // Make sure not more containers than PARALLEL_CONTAINERS are requested
-        final int workingContainers = runningContainers + containersRequested;
-        if (workingContainers < PARALLEL_CONTAINERS.get() && workingContainers < containersToWaitFor) {
-            final int toRequest = PARALLEL_CONTAINERS.get() - Math.abs(runningContainers - containersRequested);
-            if (toRequest > containersToWaitFor) {
-                requestContainers(containersToWaitFor);
+        final int workingContainers = runningContainers + pendingRequests;
+        if (workingContainers < PARALLEL_CONTAINERS.get() && workingContainers < tasksToWaitFor) {
+            final int toRequest = PARALLEL_CONTAINERS.get() - Math.abs(runningContainers - pendingRequests);
+            if (toRequest > tasksToWaitFor) {
+                requestContainers(tasksToWaitFor);
             } else {
                 requestContainers(toRequest);
             }
         }
         System.out.println("Progress: " + getProgress());
-        //System.out.println("After onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + containersRequested + " / " + containersToWaitFor);
+        //System.out.println("After onContainersCompleted: running / requested / waiting for: " + runningContainers + " / " + pendingRequests + " / " + tasksToWaitFor);
     }
 
     private void clearRequestList() {
@@ -203,7 +275,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
             System.out.println("[AM] Making request " + absoluteContainersRequested);
             rmClient.addContainerRequest(containerAsk);
             ++absoluteContainersRequested;
-            ++containersRequested;
+            ++pendingRequests;
         }
     }
 
@@ -221,9 +293,9 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
 
     public float getProgress() {
         synchronized (this) {
-            float progress = (float) complatedTasks.get() / splits;
+            float progress = (float) complatedTasks.get() / tasks.size();
             if (increased.get() == false && progress >= 0.5f) {
-                System.out.println("Increasing from " + PARALLEL_CONTAINERS.get() + " container(s) to " + 4);
+                System.out.println("Increasing from " + PARALLEL_CONTAINERS.get() + " container(s) to 4");
                 increased.set(true);
                 PARALLEL_CONTAINERS.set(4);
             }
@@ -232,7 +304,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     }
 
     public boolean doneWithContainers() {
-        return containersToWaitFor == 0;
+        return tasksToWaitFor == 0;
     }
 
     public Configuration getConfiguration() {
@@ -266,13 +338,11 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         requestContainers(PARALLEL_CONTAINERS.get());
         final TimeTuple absoluteTime = new TimeTuple(System.currentTimeMillis());
         while (!doneWithContainers()) {
-            //System.out.println("runMainLoop(): Running containers: " + runningContainers);
-            //System.out.println("runMainLoop(): Waiting for containers: " + containersToWaitFor);
             Thread.sleep(100);
         }
         absoluteTime.endTime = System.currentTimeMillis();
         System.out.println("Absolute job time: " + (absoluteTime.endTime - absoluteTime.startTime) + " ms");
-        printContainerTimes();
+        printTaskTimes();
 
         System.out.println("[AM] unregisterApplicationMaster 0");
         // Un-register with ResourceManager
@@ -281,19 +351,14 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         System.out.println("[AM] unregisterApplicationMaster 1");
     }
 
-    private void printContainerTimes() {
-        Iterator it = containerTimes.entrySet().iterator();
-        while (it.hasNext()) {
-            final Map.Entry pair = (Map.Entry)it.next();
-            final ContainerId id = (ContainerId)pair.getKey();
-            final TimeTuple t = (TimeTuple)pair.getValue();
-            System.out.println(id.toString() + " = " + (t.endTime - t.startTime) + " ms, started at " + t.startTime + " ms, ended at " + t.endTime);
-            it.remove(); // avoids a ConcurrentModificationException
+    private void printTaskTimes() {
+        for (MapTask t : tasks) {
+            System.out.println("Task " + t.id + " = " + (t.endTime - t.startTime) + " ms, started at " + t.startTime + " ms, ended at " + t.endTime);
         }
     }
 
     public static void main(String[] args) throws Exception {
-        ApplicationMasterAsync master = new ApplicationMasterAsync(new Path(args[0]), new Path(args[1]));
+        ApplicationMasterAsyncReuse master = new ApplicationMasterAsyncReuse(new Path(args[0]), new Path(args[1]));
         master.runMainLoop();
     }
 }

@@ -31,6 +31,27 @@
             <systemPath>/home/jth/work/MA/build/hadoop-3.0.0-SNAPSHOT/share/hadoop/yarn/hadoop-yarn-common-3.0.0-SNAPSHOT.jar</systemPath>
         </dependency>
         <dependency>
+            <groupId>org.apache.tez</groupId>
+            <artifactId>tez-api</artifactId>
+            <version>0.8.2-SNAPSHOT</version>
+            <scope>system</scope>
+            <systemPath>/home/jth/work/MA/build/tez/tez-api-0.8.2-SNAPSHOT.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tez</groupId>
+            <artifactId>tez-common</artifactId>
+            <version>0.8.2-SNAPSHOT</version>
+            <scope>system</scope>
+            <systemPath>/home/jth/work/MA/build/tez/tez-common-0.8.2-SNAPSHOT.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tez</groupId>
+            <artifactId>tez-dag</artifactId>
+            <version>0.8.2-SNAPSHOT</version>
+            <scope>system</scope>
+            <systemPath>/home/jth/work/MA/build/tez/tez-dag-0.8.2-SNAPSHOT.jar</systemPath>
+        </dependency>
+        <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-yarn-client</artifactId>
             <version>3.0.0-SNAPSHOT</version>

@@ -59,7 +59,7 @@ public class Client {
         final String cmd =
                 "$JAVA_HOME/bin/java" +
                         " -Xmx128M" +
-                        " de.jth.ma.wc.ApplicationMasterAsync" +
+                        " de.jth.ma.wc.ApplicationMasterTez" +
                         " " + inputPath +
                         " " + outputPath +
                         " 1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout" +
@@ -148,6 +148,12 @@ public class Client {
     }
 
     private void setupAppMasterEnv(Map<String, String> appMasterEnv) {
+        Apps.addToEnvironment(appMasterEnv,
+                Environment.CLASSPATH.name(),
+                "/home/jth/work/MA/build/tez/*");
+        Apps.addToEnvironment(appMasterEnv,
+                Environment.CLASSPATH.name(),
+                Environment.PWD.$() + File.separator + "*");
         for (String c : conf.getStrings(
                 YarnConfiguration.YARN_APPLICATION_CLASSPATH,
                 YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH)) {
@@ -155,9 +161,6 @@ public class Client {
             Apps.addToEnvironment(appMasterEnv, Environment.CLASSPATH.name(),
                     c.trim());
         }
-        Apps.addToEnvironment(appMasterEnv,
-                Environment.CLASSPATH.name(),
-                Environment.PWD.$() + File.separator + "*");
     }
 
     public static void main(String[] args) {
