@@ -18,7 +18,7 @@ import java.util.Map;
  * Created by jth on 10/6/15.
  */
 public class Mapper {
-    private final static int WAIT_TIME = 5000;
+    private final static int WAIT_TIME = 30000; // waiting time per line
     private final Path inputFile;
     private final String outputPath;
     private final int id;
@@ -61,14 +61,15 @@ public class Mapper {
                         counts.put(word, counts.get(word) + 1);
                     }
                 }
+                //Thread.sleep(WAIT_TIME); // prolong tasks artificially...
                 line = br.readLine();
             }
+            Thread.sleep(WAIT_TIME); // prolong tasks artificially...
             // TODO: Remove non printable characters. Do that while reading to avoid multiple spaces, tabs and so on. But ok for now.
             counts.remove("\t");
             //System.out.println("Counted words, closing " + inputFile.getName());
             is.close();
             System.out.println("Writing results");
-            Thread.sleep(WAIT_TIME); // prolong tasks artificially...
             writeResult(fs);
         }catch(Exception e){
             throw new RuntimeException("Could not open " + inputFile.getName() + ": " + e.getMessage());

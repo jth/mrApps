@@ -6,21 +6,27 @@ package de.jth.ma.wc;
 
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.*;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
+import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesRequest;
 import org.apache.hadoop.yarn.api.records.*;
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest;
-import org.apache.hadoop.yarn.client.api.NMClient;
 import org.apache.hadoop.yarn.client.api.async.AMRMClientAsync;
+import org.apache.hadoop.yarn.client.api.async.NMClientAsync;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
+public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, NMClientAsync.CallbackHandler {
+    private static final Logger LOG = LoggerFactory.getLogger(ApplicationMasterAsync.class);
     private final AtomicInteger PARALLEL_CONTAINERS = new AtomicInteger(1);
     private final AtomicBoolean increased = new AtomicBoolean(false);
     private static final long DEADLINE = 16000; // Deadline in ms for whole job completion
@@ -28,12 +34,13 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     private final Path inputPath;
     private final Path outputPath;
     private final int splits;
+    private final List<NodeId> availableNodes;
     private final List<ContainerRequest> requestList = new ArrayList<>();
     private final List<ContainerId> finishedContainers = new ArrayList<>();
     private final Map<ContainerId, TimeTuple> containerTimes = new HashMap<>();
     private List<Container> allocatedContainers = new ArrayList<>();
-    private Configuration configuration;
-    private NMClient nmClient;
+    private YarnConfiguration configuration;
+    private NMClientAsync nmClient;
     private AMRMClientAsync<ContainerRequest> rmClient;
     private InputSplitter splitter;
     // Counters, use atomic integer here?
@@ -44,13 +51,42 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     private int containersToWaitFor;
     private int runningContainers = 0;
 
+    @Override
+    public void onContainerStarted(ContainerId containerId, Map<String, ByteBuffer> map) {
+
+    }
+
+    @Override
+    public void onContainerStatusReceived(ContainerId containerId, ContainerStatus containerStatus) {
+
+    }
+
+    @Override
+    public void onContainerStopped(ContainerId containerId) {
+
+    }
+
+    @Override
+    public void onStartContainerError(ContainerId containerId, Throwable throwable) {
+
+    }
+
+    @Override
+    public void onGetContainerStatusError(ContainerId containerId, Throwable throwable) {
+
+    }
+
+    @Override
+    public void onStopContainerError(ContainerId containerId, Throwable throwable) {
+
+    }
+
     private static class TimeTuple {
-        public long startTime;
-        public long endTime;
+        public final long startTime;
+        public long endTime = 0;
 
         TimeTuple(long startTime) {
             this.startTime = startTime;
-            endTime = 0;
         }
 
         @Override
@@ -59,26 +95,52 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         }
     }
 
-    public ApplicationMasterAsync(Path inputPath, Path outputPath) {
+    public ApplicationMasterAsync(Path inputPath, Path outputPath, List<NodeId> availableNodes) {
         this.inputPath = inputPath;
         this.outputPath = outputPath;
+        this.availableNodes = availableNodes;
         splitter = new InputSplitter(inputPath);
         try {
             splitter.stat();
         } catch (IOException e) {
             throw new RuntimeException("Could not split input: " + e.getMessage());
         }
+        LOG.info("Logging Test");
         splits = containersToWaitFor = splitter.getStats().size();
         configuration = new YarnConfiguration();
-        nmClient = NMClient.createNMClient();
+        nmClient = NMClientAsync.createNMClientAsync(this);
         nmClient.init(configuration);
         nmClient.start();
+        System.out.println("Available Nodes: ");
+        for (NodeId nodeId : availableNodes) {
+            System.out.println(nodeId.toString());
+        }
+    }
+
+    private LocalResource setupLocalResource() {
+        try {
+            FileStatus status = FileSystem.get(configuration).getFileStatus(Client.jarPathHdfs);
+            URL packageUrl = ConverterUtils.getYarnUrlFromPath(
+                    FileContext.getFileContext().makeQualified(Client.jarPathHdfs));
+
+            LocalResource packageResource = Records.newRecord(LocalResource.class);
+            packageResource.setResource(packageUrl);
+            packageResource.setSize(status.getLen());
+            packageResource.setTimestamp(status.getModificationTime());
+            packageResource.setType(LocalResourceType.ARCHIVE);
+            packageResource.setVisibility(LocalResourceVisibility.APPLICATION);
+
+            return packageResource;
+        } catch (IOException e) {
+            throw new RuntimeException("Could not add local resource: " + e.getMessage());
+        }
     }
 
     private void execute(Container container) {
         final String command =
                 "$JAVA_HOME/bin/java" +
                         " -Xmx128M" +
+                        //" -cp './package/*'" +
                         " de.jth.ma.wc.Mapper" +
                         " " + splitter.getStats().get(ctr).getPath().toString() +
                         " " + outputPath +
@@ -88,13 +150,14 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         try {
             // Launch container by create ContainerLaunchContext
             ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
+            ctx.setLocalResources(Collections.singletonMap("package", setupLocalResource()));
             ctx.setCommands(Collections.singletonList(command));
             System.out.println("[AM] Launching container " + container.getId());
             synchronized (this) {
                 containerTimes.put(container.getId(), new TimeTuple(System.currentTimeMillis()));
                 ++runningContainers;
                 ++ctr;
-                nmClient.startContainer(container, ctx);
+                nmClient.startContainerAsync(container, ctx);
             }
             System.out.println("execute: running Containers: " + runningContainers);
         } catch (Exception ex) {
@@ -108,7 +171,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         for (Container container : containers) {
             synchronized (this) {
                 allocatedContainers.add(container);
-                System.out.println(" -> Allocated container: " + container.getId().toString());
+                System.out.println(" -> Allocated container: " + container.getId().toString() + " on " + container.getNodeId().toString());
                 --containersRequested;
                 execute(container);
             }
@@ -195,6 +258,10 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     }
 
     public void onNodesUpdated(List<NodeReport> updated) {
+        System.out.println("Nodes updated:");
+        for (NodeReport report : updated) {
+            System.out.println("Nodes: Rack = " +  report.getRackName() + ", Name = " + report.getNodeId().toString());
+        }
     }
 
     public void onReboot() {
@@ -207,12 +274,13 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     }
 
     public float getProgress() {
+        final GetClusterNodesRequest nodes = GetClusterNodesRequest.newInstance();
         synchronized (this) {
             float progress = (float) completedContainers.get() / splits;
-            if (increased.get() == false && progress >= 0.5f) {
+            if (increased.get() == false && progress >= 0.3f) {
                 System.out.println("Increasing from " + PARALLEL_CONTAINERS.get() + " container(s) to " + 4);
                 increased.set(true);
-                PARALLEL_CONTAINERS.set(4);
+                PARALLEL_CONTAINERS.set(8);
             }
             return progress;
         }
@@ -255,6 +323,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
         while (!doneWithContainers()) {
             //System.out.println("runMainLoop(): Running containers: " + runningContainers);
             //System.out.println("runMainLoop(): Waiting for containers: " + containersToWaitFor);
+            System.out.println("Graph: " + (System.currentTimeMillis() - absoluteTime.startTime)/1000 + ";" + getProgress()*100.f);
             Thread.sleep(100);
         }
         absoluteTime.endTime = System.currentTimeMillis();
@@ -280,7 +349,13 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler {
     }
 
     public static void main(String[] args) throws Exception {
-        ApplicationMasterAsync master = new ApplicationMasterAsync(new Path(args[0]), new Path(args[1]));
+        final List<NodeId> nodes = new ArrayList<>();
+        // Parse NodeIds given by Yarn Client
+        for (int i = 2; i < args.length; i++) {
+            final String[] nodeTuple = args[i].trim().split(":");
+            nodes.add(NodeId.newInstance(nodeTuple[0], Integer.parseInt(nodeTuple[1])));
+        }
+        ApplicationMasterAsync master = new ApplicationMasterAsync(new Path(args[0]), new Path(args[1]), nodes);
         master.runMainLoop();
     }
 }

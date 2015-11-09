@@ -26,6 +26,7 @@ public class ApplicationMaster {
     private Path inputPath;
     private Path outputPath;
     private InputSplitter splitter;
+    private Configuration configuration;
     private final Map<ContainerId, TimeTuple> times = new HashMap<>();
     private final List<ContainerId> runningContainers = new ArrayList<>();
     private final List<ContainerId> finishedContainers = new ArrayList<>();
@@ -48,14 +49,14 @@ public class ApplicationMaster {
         System.out.println("Number of input splits: " + splits);
 
         // Initialize clients to ResourceManager and NodeManagers
-        Configuration conf = new YarnConfiguration();
+        configuration = new YarnConfiguration();
 
         rmClient = AMRMClient.createAMRMClient();
-        rmClient.init(conf);
+        rmClient.init(configuration);
         rmClient.start();
 
         nmClient = NMClient.createNMClient();
-        nmClient.init(conf);
+        nmClient.init(configuration);
         nmClient.start();
 
         // Register with ResourceManager
@@ -96,8 +97,12 @@ public class ApplicationMaster {
         }
     }
 
-    private void removeGrantedRequests() {
+    private List<String> getAllNodes() {
+        System.out.println("Nodes in the cluster: " + rmClient.getClusterNodeCount());
+        return null;
+    }
 
+    private void removeGrantedRequests() {
     }
 
     public void run() throws IOException, YarnException, InterruptedException {
