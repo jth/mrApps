@@ -5,8 +5,13 @@ package de.jth.ma.wc;
  */
 
 
+import com.google.gson.Gson;
+import com.google.gson.stream.JsonReader;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.*;
+import org.apache.hadoop.fs.FileContext;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesRequest;
 import org.apache.hadoop.yarn.api.records.*;
@@ -16,19 +21,17 @@ import org.apache.hadoop.yarn.client.api.async.NMClientAsync;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, NMClientAsync.CallbackHandler {
-    private static final Logger LOG = LoggerFactory.getLogger(ApplicationMasterAsync.class);
-    private final AtomicInteger PARALLEL_CONTAINERS = new AtomicInteger(1);
-    private final AtomicBoolean increased = new AtomicBoolean(false);
+    private final AtomicInteger PARALLEL_CONTAINERS = new AtomicInteger();
+    private final AtomicBoolean increased1 = new AtomicBoolean(false);
+    private final AtomicBoolean increased2 = new AtomicBoolean(false);
     private static final long DEADLINE = 16000; // Deadline in ms for whole job completion
     private int estimatedDeadline = 0; // Estimated job finish
     private final Path inputPath;
@@ -38,6 +41,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, 
     private final List<ContainerRequest> requestList = new ArrayList<>();
     private final List<ContainerId> finishedContainers = new ArrayList<>();
     private final Map<ContainerId, TimeTuple> containerTimes = new HashMap<>();
+    private final AppMasterConfig appMasterConfig;
     private List<Container> allocatedContainers = new ArrayList<>();
     private YarnConfiguration configuration;
     private NMClientAsync nmClient;
@@ -95,17 +99,26 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, 
         }
     }
 
+    AppMasterConfig readConfig(String filename) {
+        Gson gson = new Gson();
+        InputStream in = getClass().getResourceAsStream("/" + filename);
+        BufferedReader input = new BufferedReader(new InputStreamReader(in));
+        return gson.fromJson(new JsonReader(input), AppMasterConfig.class);
+    }
+
     public ApplicationMasterAsync(Path inputPath, Path outputPath, List<NodeId> availableNodes) {
         this.inputPath = inputPath;
         this.outputPath = outputPath;
         this.availableNodes = availableNodes;
+        this.appMasterConfig = readConfig("appmaster.conf");
+        System.out.println("Using config: " + appMasterConfig.toString());
+        PARALLEL_CONTAINERS.set(appMasterConfig.initialContainers);
         splitter = new InputSplitter(inputPath);
         try {
             splitter.stat();
         } catch (IOException e) {
             throw new RuntimeException("Could not split input: " + e.getMessage());
         }
-        LOG.info("Logging Test");
         splits = containersToWaitFor = splitter.getStats().size();
         configuration = new YarnConfiguration();
         nmClient = NMClientAsync.createNMClientAsync(this);
@@ -145,6 +158,7 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, 
                         " " + splitter.getStats().get(ctr).getPath().toString() +
                         " " + outputPath +
                         " " + ctr +
+                        " " + appMasterConfig.taskDuration +
                         " 1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout" +
                         " 2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr";
         try {
@@ -277,11 +291,23 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, 
         final GetClusterNodesRequest nodes = GetClusterNodesRequest.newInstance();
         synchronized (this) {
             float progress = (float) completedContainers.get() / splits;
-            if (increased.get() == false && progress >= 0.3f) {
-                System.out.println("Increasing from " + PARALLEL_CONTAINERS.get() + " container(s) to " + 4);
-                increased.set(true);
-                PARALLEL_CONTAINERS.set(8);
+
+            if (appMasterConfig.increaseAfter1 >= 0.f) {
+                if (increased1.get() == false && progress >= appMasterConfig.increaseAfter1) {
+                    System.out.println("Increasing first time from " + PARALLEL_CONTAINERS.get() + " container(s) to " + appMasterConfig.increasedContainers1);
+                    increased1.set(true);
+                    PARALLEL_CONTAINERS.set(appMasterConfig.increasedContainers1);
+                }
             }
+
+            if (appMasterConfig.increaseAfter2 >= 0.f) {
+                if (increased2.get() == false && progress >= appMasterConfig.increaseAfter2) {
+                    System.out.println("Increasing second time from " + PARALLEL_CONTAINERS.get() + " container(s) to " + appMasterConfig.increasedContainers2);
+                    increased2.set(true);
+                    PARALLEL_CONTAINERS.set(appMasterConfig.increasedContainers2);
+                }
+            }
+
             return progress;
         }
     }
@@ -320,11 +346,12 @@ public class ApplicationMasterAsync implements AMRMClientAsync.CallbackHandler, 
         System.out.println("[AM] waiting for containers to finish");
         requestContainers(PARALLEL_CONTAINERS.get());
         final TimeTuple absoluteTime = new TimeTuple(System.currentTimeMillis());
+        long lastTime = 0;
         while (!doneWithContainers()) {
             //System.out.println("runMainLoop(): Running containers: " + runningContainers);
             //System.out.println("runMainLoop(): Waiting for containers: " + containersToWaitFor);
             System.out.println("Graph: " + (System.currentTimeMillis() - absoluteTime.startTime)/1000 + ";" + getProgress()*100.f);
-            Thread.sleep(100);
+            Thread.sleep(1000);
         }
         absoluteTime.endTime = System.currentTimeMillis();
         System.out.println("Absolute job time: " + (absoluteTime.endTime - absoluteTime.startTime) + " ms");

@@ -18,16 +18,17 @@ import java.util.Map;
  * Created by jth on 10/6/15.
  */
 public class Mapper {
-    private final static int WAIT_TIME = 30000; // waiting time per line
     private final Path inputFile;
     private final String outputPath;
     private final int id;
+    private final int taskDuration;
     private final Map<String, Long> counts = new HashMap<>();
 
-    Mapper(Path inputFile, String outputPath, int id) {
+    Mapper(Path inputFile, String outputPath, int id, int taskDuration) {
         this.inputFile = inputFile;
         this.outputPath = outputPath;
         this.id = id;
+        this.taskDuration = taskDuration;
     }
 
     private void writeResult(FileSystem fs) throws IOException {
@@ -64,7 +65,7 @@ public class Mapper {
                 //Thread.sleep(WAIT_TIME); // prolong tasks artificially...
                 line = br.readLine();
             }
-            Thread.sleep(WAIT_TIME); // prolong tasks artificially...
+            Thread.sleep(taskDuration); // prolong tasks artificially...
             // TODO: Remove non printable characters. Do that while reading to avoid multiple spaces, tabs and so on. But ok for now.
             counts.remove("\t");
             //System.out.println("Counted words, closing " + inputFile.getName());
@@ -77,7 +78,7 @@ public class Mapper {
     }
 
     public static void main(String args[]) {
-        final Mapper mapTask = new Mapper(new Path(args[0]), args[1], Integer.valueOf(args[2]));
+        final Mapper mapTask = new Mapper(new Path(args[0]), args[1], Integer.valueOf(args[2]), Integer.valueOf(args[3]));
         mapTask.exec();
     }
 }
