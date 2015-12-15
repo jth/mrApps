@@ -30,7 +30,7 @@ import java.util.List;
 import java.util.Map;
 
 public class Client {
-    public static final Path jarPathHdfs = new Path("hdfs:///users/jth/wc/jthWordCount-0.1-SNAPSHOT.jar");
+    public static final Path jarPathHdfs = new Path("/users/jth/wc/jthWordCount-0.1-SNAPSHOT-jar-with-dependencies.jar");
     Configuration conf = new YarnConfiguration();
 
     private LocalResource setupLocalResource() {
